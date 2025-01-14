@@ -255,22 +255,23 @@ async def audio_websocket_handler(request):
 async def websocket_handler(request):
     global prompt_data, coordinates_data
 
-    stream_handler = request.app["streams"][request.match_info["stream_id"]]
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-    logger.info(f"WebSocket connected for stream: {request.match_info['stream_id']}")
+    logging.info("Websocket connected.")
     request.app["websockets"].add(ws)
 
     try:
         async for msg in ws:
             # ws json object prompt 範例: {"json": "[{\"object\": \"apple\", \"threshold\": \"0.5\"}, {\"object\": \"banana\", \"threshold\": \"0.5\"}]"}
-            # ws json 四點位座標範例：{"coordinate": "[{\"top_left_x\": \"200\",\"top_left_y\": \"250\",\"top_right_y\": \"250\",\"top_right_y\": \"270\", \"bottom_left_x\": \"500\", \"bottom_left_y\": \"550\", \"bottom_right_y\": \"550\", \"bottom_right_y\": \"300\"}]"}
+            # ws json 座標範例：{"coordinate": "[{\"top_left_x\": \"200\",\"top_left_y\": \"250\", \"bottom_left_x\": \"500\", \"bottom_left_y\": \"550\"}]"}
             logging.info(f"Received message from websocket: {msg.data}")
             if "json" in msg.data:
                 try:
                     data = json.loads(msg.data)["json"]
                     prompt = f"[{', '.join([item['object'] for item in data])}]"
-                    threshold = {item["object"]: float(item["threshold"]) for item in data}
+                    threshold = {
+                        item["object"]: float(item["threshold"]) for item in data
+                    }
                     logging.info(f"Converted prompt: {prompt}")
 
                     tree = Tree.from_prompt(prompt)
@@ -427,43 +428,6 @@ async def run_detection_loop(app):
         await task
 
 
-class RTSPStreamHandler:
-    def __init__(self, rtsp_url, queue_size=10):
-        self.rtsp_url = rtsp_url
-        self.frame_queue = Queue(maxsize=queue_size)
-        self.camera = None
-        self.running = False
-
-    def start(self):
-        self.running = True
-        self.camera = cv2.VideoCapture(self.rtsp_url)
-        threading.Thread(target=self._capture_loop, daemon=True).start()
-
-    def stop(self):
-        self.running = False
-        if self.camera:
-            self.camera.release()
-
-    def _capture_loop(self):
-        while self.running:
-            if not self.camera.isOpened():
-                logger.error(f"Failed to open RTSP stream: {self.rtsp_url}")
-                self.camera = cv2.VideoCapture(self.rtsp_url)
-                continue
-
-            ret, frame = self.camera.read()
-            if ret:
-                if not self.frame_queue.full():
-                    self.frame_queue.put_nowait(frame)
-            else:
-                logger.warning(
-                    f"Failed to read frame from RTSP stream: {self.rtsp_url}"
-                )
-
-    async def get_frame(self):
-        return await self.frame_queue.get()
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("image_encode_engine", type=str)
@@ -498,24 +462,12 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.INFO)
     app = web.Application()
-    app["streams"] = {}
     app["websockets"] = weakref.WeakSet()
     app.router.add_get("/", handle_index_get)
     app.router.add_route("GET", "/ws", websocket_handler)
     app.router.add_route("GET", "/audio", audio_websocket_handler)
 
-    # Initialize RTSP handlers
-    for idx, rtsp_url in enumerate(args.rtsp_urls):
-        stream_id = f"stream{idx+1}"
-        stream_handler = RTSPStreamHandler(rtsp_url)
-        stream_handler.start()
-        app["streams"][stream_id] = stream_handler
-
-        # Add WebSocket route for this stream
-        app.router.add_route("GET", f"/ws/{stream_id}", websocket_handler)
-
     app.on_shutdown.append(on_shutdown)
     app.cleanup_ctx.append(run_detection_loop)
 
-    logger.info("Starting server...")
     web.run_app(app, host=args.host, port=args.port)
