@@ -1,0 +1,16 @@
+__pycache__
+*.pyc
+*.tar.gz
+*.so
+*.deb
+data/*
+logs
+test/data
+runner
+*.minus-github-api
+.DS_Store
+.vscode
+.ninja_log
+.polyscope.ini
+.ipynb_checkpoints
+.idea
