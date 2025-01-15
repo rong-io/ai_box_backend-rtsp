@@ -47,6 +47,67 @@ logger.setLevel(logging.INFO)
 audio_queue = Queue()
 
 
+class RTSPStreamHandler:
+    def __init__(self, rtsp_url, model, queue_size=10):
+        self.rtsp_url = rtsp_url
+        self.frame_queue = Queue(maxsize=queue_size)
+        self.camera = None
+        self.running = False
+        self.model = model
+
+    def start(self):
+        if not self.running:
+            self.running = True
+            self.camera = cv2.VideoCapture(self.rtsp_url)
+            threading.Thread(target=self._capture_loop, daemon=True).start()
+
+    def stop(self):
+        if self.running:
+            self.running = False
+            if self.camera:
+                self.camera.release()
+
+    def _capture_loop(self):
+        while self.running:
+            if not self.camera.isOpened():
+                logger.error(f"Failed to open RTSP stream: {self.rtsp_url}")
+                self.camera = cv2.VideoCapture(self.rtsp_url)
+                continue
+
+            ret, frame = self.camera.read()
+            if ret:
+                frame = self._process_frame(frame)
+                if not self.frame_queue.full():
+                    self.frame_queue.put_nowait(frame)
+            else:
+                logger.warning(
+                    f"Failed to read frame from RTSP stream: {self.rtsp_url}"
+                )
+
+    def _process_frame(self, frame):
+        try:
+            detections = self.model.predict(frame)
+            for detection in detections:
+                x1, y1, x2, y2 = detection["bbox"]
+                label = detection["label"]
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(
+                    frame,
+                    label,
+                    (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 255, 0),
+                    2,
+                )
+        except Exception as e:
+            logger.error(f"Error during frame processing: {e}")
+        return frame
+
+    async def get_frame(self):
+        return await self.frame_queue.get()
+
+
 # RTSP audio
 def extract_audio(rtsp_url, audio_queue):
     process = (
@@ -127,110 +188,72 @@ def cv2_to_pil(image):
     return PIL.Image.fromarray(image)
 
 
-def process_coordinates_and_draw(image, coordinates, detections, tree):
+def process_coordinates_with_affine(image, coordinates):
+    """
+    根據不規則四邊形的座標進行仿射變換，返回轉換後的影像和處理的區域資訊。
+    """
+    transformed_regions = []
+
+    if not coordinates or not isinstance(coordinates, list):
+        raise ValueError("Coordinates must be a non-empty list of dictionaries.")
+
     for coord in coordinates:
         try:
-            top_left_x = int(coord["top_left_x"])
-            top_left_y = int(coord["top_left_y"])
-            bottom_left_x = int(coord["bottom_left_x"])
-            bottom_left_y = int(coord["bottom_left_y"])
+            # 檢查座標是否完整
+            required_keys = [
+                "top_left_x",
+                "top_left_y",
+                "top_right_x",
+                "top_right_y",
+                "bottom_right_x",
+                "bottom_right_y",
+                "bottom_left_x",
+                "bottom_left_y",
+            ]
+            if not all(key in coord for key in required_keys):
+                raise ValueError(f"Incomplete coordinate data: {coord}")
 
-            # 畫出裁切範圍(測試用，整合後註解)
-            cv2.rectangle(
+            # 初始化 src_pts
+            src_pts = np.array(
+                [
+                    [int(coord["top_left_x"]), int(coord["top_left_y"])],
+                    [int(coord["top_right_x"]), int(coord["top_right_y"])],
+                    [int(coord["bottom_right_x"]), int(coord["bottom_right_y"])],
+                    [int(coord["bottom_left_x"]), int(coord["bottom_left_y"])],
+                ],
+                dtype=np.float32,
+            )
+
+            # 計算目標矩形的寬高
+            width = int(np.linalg.norm(src_pts[0] - src_pts[1]))
+            height = int(np.linalg.norm(src_pts[0] - src_pts[3]))
+
+            dst_pts = np.array(
+                [[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]],
+                dtype=np.float32,
+            )
+
+            # 計算透視變換矩陣
+            matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
+
+            # 仿射變換並裁切為矩形
+            warped_image = cv2.warpPerspective(image, matrix, (width, height))
+
+            # 繪製多邊形範圍
+            cv2.polylines(
                 image,
-                (top_left_x, top_left_y),
-                (bottom_left_x, bottom_left_y),
-                (0, 255, 0),
-                2,
+                [src_pts.astype(np.int32)],
+                isClosed=True,
+                color=(0, 255, 0),
+                thickness=2,
             )
 
-            cropped_image = image[top_left_y:bottom_left_y, top_left_x:bottom_left_x]
+            transformed_regions.append((warped_image, (src_pts, dst_pts)))
 
-            cropped_pil = cv2_to_pil(cropped_image)
-            cropped_detections = predictor.predict(
-                image=cropped_pil,
-                tree=tree,
-                clip_text_encodings=prompt_data["clip_encodings"],
-                owl_text_encodings=prompt_data["owl_encodings"],
-            )
-
-            image = draw_tree_output(image, cropped_detections, tree)
         except Exception as e:
-            logging.error(f"Error processing coordinates: {e}")
+            logging.error(f"Error during affine transform: {e}")
 
-    return image
-
-
-def process_coordinates_and_recognize(image, coordinates, tree):
-    """
-    根據座標裁切影像並輸入模型進行辨識
-    """
-    results = []
-    for coord in coordinates:
-        try:
-            top_left_x = int(coord["top_left_x"])
-            top_left_y = int(coord["top_left_y"])
-            bottom_left_x = int(coord["bottom_left_x"])
-            bottom_left_y = int(coord["bottom_left_y"])
-
-            cropped_image = image[top_left_y:bottom_left_y, top_left_x:bottom_left_x]
-            cropped_pil = cv2_to_pil(cropped_image)
-
-            cropped_detections = predictor.predict(
-                image=cropped_pil,
-                tree=tree,
-                clip_text_encodings=prompt_data["clip_encodings"],
-                owl_text_encodings=prompt_data["owl_encodings"],
-            )
-            results.append(cropped_detections)
-        except Exception as e:
-            logging.error(f"Error processing coordinates: {e}")
-
-    return results
-
-
-def process_coordinates_and_recognize_with_overlay(image, coordinates, tree):
-    """
-    根據座標裁切影像，輸入模型進行辨識，並將結果疊加回原圖。
-    """
-    for coord in coordinates:
-        try:
-            top_left_x = int(round(coord["top_left_x"]))
-            top_left_y = int(round(coord["top_left_y"]))
-            bottom_right_x = int(round(coord["bottom_left_x"]))
-            bottom_right_y = int(round(coord["bottom_left_y"]))
-
-            # 確認座標範圍有效性
-            cv2.rectangle(
-                image,
-                (top_left_x, top_left_y),
-                (bottom_right_x, bottom_right_y),
-                (0, 255, 0),  # 綠色框
-                3,
-            )
-
-            logging.info(
-                f"Drawing rectangle: Top-Left ({top_left_x}, {top_left_y}), "
-                f"Bottom-Right ({bottom_right_x}, {bottom_right_y})"
-            )
-
-            cropped_image = image[top_left_y:bottom_right_y, top_left_x:bottom_right_x]
-            cropped_pil = cv2_to_pil(cropped_image)
-
-            cropped_detections = predictor.predict(
-                image=cropped_pil,
-                tree=tree,
-                clip_text_encodings=prompt_data["clip_encodings"],
-                owl_text_encodings=prompt_data["owl_encodings"],
-            )
-
-            if cropped_detections:
-                logging.info(f"Cropped detections: {cropped_detections}")
-                image = draw_tree_output(image, cropped_detections, tree)
-        except Exception as e:
-            logging.error(f"Error processing coordinates: {e}")
-
-    return image
+    return image, transformed_regions
 
 
 # WebSocket handler for audio transmission
@@ -248,8 +271,7 @@ async def audio_websocket_handler(request):
     finally:
         logging.info("Audio WebSocket disconnected.")
         await ws.close()
-
-    return ws
+        return ws
 
 
 async def websocket_handler(request):
@@ -257,14 +279,21 @@ async def websocket_handler(request):
 
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-    logging.info("Websocket connected.")
+    logger.info(f"WebSocket connected: {request.remote}")
     request.app["websockets"].add(ws)
 
     try:
         async for msg in ws:
             # ws json object prompt 範例: {"json": "[{\"object\": \"apple\", \"threshold\": \"0.5\"}, {\"object\": \"banana\", \"threshold\": \"0.5\"}]"}
             # ws json 座標範例：{"coordinate": "[{\"top_left_x\": \"200\",\"top_left_y\": \"250\", \"bottom_left_x\": \"500\", \"bottom_left_y\": \"550\"}]"}
+
+            data = json.loads(msg.data)
+            action = data.get("action")
+            stream_id = data.get("stream_id")
+
             logging.info(f"Received message from websocket: {msg.data}")
+
+            # 處理 prompt
             if "json" in msg.data:
                 try:
                     data = json.loads(msg.data)["json"]
@@ -287,6 +316,7 @@ async def websocket_handler(request):
                 except Exception as e:
                     logging.error(f"Error generating prompt data: {e}")
 
+            # 處理四點位座標
             elif "coordinate" in msg.data:
                 try:
                     data = json.loads(msg.data)
@@ -295,6 +325,22 @@ async def websocket_handler(request):
                     logging.info(f"Coordinates updated: {coordinates_data}")
                 except Exception as e:
                     logging.error(f"Error parsing coordinates: {e}")
+
+            # 處理 streams 開關 -> 改成用i/f moudle 讀 config 來執行
+            elif "action" in msg.data:
+                if action == "enable":
+                    for sid, handler in request.app["streams"].items():
+                        if sid == stream_id:
+                            handler.start()
+                            logger.info(f"Stream {stream_id} started.")
+                        else:
+                            handler.stop()
+                            logger.info(f"Stream {sid} stopped.")
+                elif action == "disable":
+                    # 停止指定的串流
+                    if stream_id in request.app["streams"]:
+                        request.app["streams"][stream_id].stop()
+                        logger.info(f"Stream {stream_id} stopped.")
     finally:
         request.app["websockets"].discard(ws)
 
@@ -355,7 +401,9 @@ async def detection_loop(app: web.Application):
 
             return re, None
 
-        # Detection phase
+        """
+        Detection phase
+        """
         image_pil = cv2_to_pil(image)
 
         if prompt_data is not None:
@@ -365,12 +413,26 @@ async def detection_loop(app: web.Application):
 
                 if coordinates_data:
                     logging.info(f"Processing coordinates: {coordinates_data}")
-                    image = process_coordinates_and_recognize_with_overlay(
-                        image=image,
-                        coordinates=coordinates_data,
-                        tree=prompt_data["tree"],
+                    image, transformed_regions = process_coordinates_with_affine(
+                        image, coordinates_data
                     )
-                    logging.info("Overlay results on original image.")
+                    detections = []
+                    for warped_image, (src_pts, dst_pts) in transformed_regions:
+                        try:
+                            cropped_pil = cv2_to_pil(warped_image)
+                            region_detections = predictor.predict(
+                                image=cropped_pil,
+                                tree=prompt_data_local["tree"],
+                                clip_text_encodings=prompt_data_local["clip_encodings"],
+                                owl_text_encodings=prompt_data_local["owl_encodings"],
+                                threshold=prompt_data_local["thresholds"]
+                            )
+                            detections.extend(region_detections)
+                        except Exception as e:
+                            logging.error(f"Prediction error for region: {e}")
+                    image = draw_tree_output(
+                        image, detections, prompt_data_local["tree"]
+                    )
 
                 else:
                     logging.info(f"Performing full image detection with prompt_data.")
@@ -380,7 +442,7 @@ async def detection_loop(app: web.Application):
                         tree=prompt_data_local["tree"],
                         clip_text_encodings=prompt_data_local["clip_encodings"],
                         owl_text_encodings=prompt_data_local["owl_encodings"],
-                        threshold=prompt_data_local["thresholds"],
+                        threshold=prompt_data_local["thresholds"]
                     )
                     t1 = time.perf_counter_ns()
                     dt = (t1 - t0) / 1e9
@@ -462,7 +524,16 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.INFO)
     app = web.Application()
+    app["streams"] = {}
     app["websockets"] = weakref.WeakSet()
+
+    for idx, rtsp_url in enumerate(args.rtsp_urls):
+        stream_id = f"stream{idx+1}"
+        stream_handler = RTSPStreamHandler(rtsp_url, predictor)
+        app["streams"][stream_id] = stream_handler
+
+        app.router.add_route("GET", f"/ws/{stream_id}", websocket_handler)
+
     app.router.add_get("/", handle_index_get)
     app.router.add_route("GET", "/ws", websocket_handler)
     app.router.add_route("GET", "/audio", audio_websocket_handler)
@@ -470,4 +541,5 @@ if __name__ == "__main__":
     app.on_shutdown.append(on_shutdown)
     app.cleanup_ctx.append(run_detection_loop)
 
+    logger.info("Starting server...")
     web.run_app(app, host=args.host, port=args.port)
