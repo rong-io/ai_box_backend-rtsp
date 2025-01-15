@@ -190,7 +190,7 @@ def cv2_to_pil(image):
 
 def process_coordinates_with_affine(image, coordinates):
     """
-    根據不規則四邊形的座標進行仿射變換，返回轉換後的影像和處理的區域資訊。
+    Perform an affine transformation based on the coordinates of an irregular quadrilateral and return the transformed image along with the processed region's information.
     """
     transformed_regions = []
 
@@ -199,7 +199,6 @@ def process_coordinates_with_affine(image, coordinates):
 
     for coord in coordinates:
         try:
-            # 檢查座標是否完整
             required_keys = [
                 "top_left_x",
                 "top_left_y",
@@ -211,9 +210,10 @@ def process_coordinates_with_affine(image, coordinates):
                 "bottom_left_y",
             ]
             if not all(key in coord for key in required_keys):
+                logging.error(f"Missing keys in coordinate: {coord}")
                 raise ValueError(f"Incomplete coordinate data: {coord}")
 
-            # 初始化 src_pts
+            logging.info(f"Initializing src_pts with: {coord}")
             src_pts = np.array(
                 [
                     [int(coord["top_left_x"]), int(coord["top_left_y"])],
@@ -224,7 +224,6 @@ def process_coordinates_with_affine(image, coordinates):
                 dtype=np.float32,
             )
 
-            # 計算目標矩形的寬高
             width = int(np.linalg.norm(src_pts[0] - src_pts[1]))
             height = int(np.linalg.norm(src_pts[0] - src_pts[3]))
 
@@ -233,13 +232,8 @@ def process_coordinates_with_affine(image, coordinates):
                 dtype=np.float32,
             )
 
-            # 計算透視變換矩陣
             matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
-
-            # 仿射變換並裁切為矩形
             warped_image = cv2.warpPerspective(image, matrix, (width, height))
-
-            # 繪製多邊形範圍
             cv2.polylines(
                 image,
                 [src_pts.astype(np.int32)],
@@ -262,16 +256,36 @@ async def audio_websocket_handler(request):
     await ws.prepare(request)
     logging.info("Audio WebSocket connected.")
 
+    # rtsp_url = "rtsp://35.185.165.215:31554/mystream1"
+
+    process = (
+        ffmpeg.input(RTSP_URL)
+        .output(
+            "pipe:",
+            format="adts",
+            acodec="aac",
+            ar="44100",
+            ac=1,
+            b="128k",
+        )
+        .global_args("-hide_banner", "-loglevel", "error")
+        .run_async(pipe_stdout=True, pipe_stderr=True)
+    )
+
     try:
         while True:
-            audio_data = await asyncio.get_running_loop().run_in_executor(
-                None, audio_queue.get
-            )
+            audio_data = await asyncio.to_thread(process.stdout.read, 2048)
+            if not audio_data:
+                logging.warning("No audio data received, stream ended.")
+                break
             await ws.send_bytes(audio_data)
+    except Exception as e:
+        logging.error(f"Error in audio stream: {e}")
     finally:
         logging.info("Audio WebSocket disconnected.")
+        process.terminate()
         await ws.close()
-        return ws
+    return ws
 
 
 async def websocket_handler(request):
@@ -282,10 +296,13 @@ async def websocket_handler(request):
     logger.info(f"WebSocket connected: {request.remote}")
     request.app["websockets"].add(ws)
 
+    global audio_enabled
+    audio_enabled = True
+
     try:
         async for msg in ws:
-            # ws json object prompt 範例: {"json": "[{\"object\": \"apple\", \"threshold\": \"0.5\"}, {\"object\": \"banana\", \"threshold\": \"0.5\"}]"}
-            # ws json 座標範例：{"coordinate": "[{\"top_left_x\": \"200\",\"top_left_y\": \"250\", \"bottom_left_x\": \"500\", \"bottom_left_y\": \"550\"}]"}
+            # ws json object prompt : {"json": "[{\"object\": \"apple\", \"threshold\": \"0.5\"}, {\"object\": \"banana\", \"threshold\": \"0.5\"}]"}
+            # ws json testing data example: {"coordinate": "[{\"top_left_x\": \"200\",\"top_left_y\": \"250\", \"bottom_left_x\": \"500\", \"bottom_left_y\": \"550\"}]"}
 
             data = json.loads(msg.data)
             action = data.get("action")
@@ -293,7 +310,7 @@ async def websocket_handler(request):
 
             logging.info(f"Received message from websocket: {msg.data}")
 
-            # 處理 prompt
+            # ?? prompt
             if "json" in msg.data:
                 try:
                     data = json.loads(msg.data)["json"]
@@ -316,12 +333,25 @@ async def websocket_handler(request):
                 except Exception as e:
                     logging.error(f"Error generating prompt data: {e}")
 
-            # 處理四點位座標
             elif "coordinate" in msg.data:
                 try:
-                    data = json.loads(msg.data)
-                    coordinate_data = data["coordinate"]
-                    coordinates_data = [coordinate_data]
+                    raw_coordinates = json.loads(msg.data)["coordinate"]
+                    coordinates = json.loads(raw_coordinates)
+
+                    for coord in coordinates:
+                        required_keys = [
+                            "top_left_x",
+                            "top_left_y",
+                            "top_right_x",
+                            "top_right_y",
+                            "bottom_right_x",
+                            "bottom_right_y",
+                            "bottom_left_x",
+                            "bottom_left_y",
+                        ]
+                        if not all(key in coord for key in required_keys):
+                            raise ValueError(f"Incomplete coordinate data: {coord}")
+                    coordinates_data = coordinates
                     logging.info(f"Coordinates updated: {coordinates_data}")
                 except Exception as e:
                     logging.error(f"Error parsing coordinates: {e}")
@@ -337,7 +367,6 @@ async def websocket_handler(request):
                             handler.stop()
                             logger.info(f"Stream {sid} stopped.")
                 elif action == "disable":
-                    # 停止指定的串流
                     if stream_id in request.app["streams"]:
                         request.app["streams"][stream_id].stop()
                         logger.info(f"Stream {stream_id} stopped.")
@@ -392,7 +421,7 @@ async def detection_loop(app: web.Application):
             warning_data = {"type": "warning", "message": warning_msg}
             asyncio.run(send_warning_to_clients(warning_data))
 
-            # 超時重連
+            # ????
             camera.release()
             camera = cv2.VideoCapture(RTSP_URL)
             if not camera.isOpened():
@@ -416,6 +445,11 @@ async def detection_loop(app: web.Application):
                     image, transformed_regions = process_coordinates_with_affine(
                         image, coordinates_data
                     )
+                    if not transformed_regions:
+                        logging.warning(
+                            "No valid regions found after affine transformation."
+                        )
+                        return image
                     detections = []
                     for warped_image, (src_pts, dst_pts) in transformed_regions:
                         try:
@@ -425,7 +459,7 @@ async def detection_loop(app: web.Application):
                                 tree=prompt_data_local["tree"],
                                 clip_text_encodings=prompt_data_local["clip_encodings"],
                                 owl_text_encodings=prompt_data_local["owl_encodings"],
-                                threshold=prompt_data_local["thresholds"]
+                                threshold=prompt_data_local["thresholds"],
                             )
                             detections.extend(region_detections)
                         except Exception as e:
@@ -442,7 +476,7 @@ async def detection_loop(app: web.Application):
                         tree=prompt_data_local["tree"],
                         clip_text_encodings=prompt_data_local["clip_encodings"],
                         owl_text_encodings=prompt_data_local["owl_encodings"],
-                        threshold=prompt_data_local["thresholds"]
+                        threshold=prompt_data_local["thresholds"],
                     )
                     t1 = time.perf_counter_ns()
                     dt = (t1 - t0) / 1e9
@@ -527,7 +561,7 @@ if __name__ == "__main__":
     app["streams"] = {}
     app["websockets"] = weakref.WeakSet()
 
-    for idx, rtsp_url in enumerate(args.rtsp_urls):
+    for idx, rtsp_url in enumerate(args.rtsp_url):
         stream_id = f"stream{idx+1}"
         stream_handler = RTSPStreamHandler(rtsp_url, predictor)
         app["streams"][stream_id] = stream_handler
