@@ -1,0 +1,58 @@
+[
+    {
+        "stream_id": "camera_1",
+        "rtsp_url": "rtsp://35.185.165.215:31554/mystream1",
+        "status": "updated",
+        "start_time": "2025-01-08 10:00:00",
+        "stop_time": "2025-01-08 12:00:00"
+    },
+    {
+        "stream_id": "camera_2",
+        "rtsp_url": "rtsp://35.185.165.215:31554/mystream2",
+        "status": "",
+        "start_time": "",
+        "stop_time": ""
+    },
+    {
+        "stream_id": "camera_3",
+        "rtsp_url": "rtsp://35.185.165.215:31554/mystream3",
+        "status": "",
+        "start_time": "",
+        "stop_time": ""
+    },
+    {
+        "stream_id": "camera_4",
+        "rtsp_url": "rtsp://35.185.165.215:31554/mystream4",
+        "status": "",
+        "start_time": "",
+        "stop_time": ""
+    },
+    {
+        "stream_id": "camera_5",
+        "rtsp_url": "rtsp://35.185.165.215:31554/mystream5",
+        "status": "",
+        "start_time": "",
+        "stop_time": ""
+    },
+    {
+        "stream_id": "camera_6",
+        "rtsp_url": "rtsp://35.185.165.215:31554/mystream6",
+        "status": "",
+        "start_time": "",
+        "stop_time": ""
+    },
+    {
+        "stream_id": "camera_7",
+        "rtsp_url": "rtsp://35.185.165.215:31554/mystream7",
+        "status": "",
+        "start_time": "",
+        "stop_time": ""
+    },
+    {
+        "stream_id": "camera_8",
+        "rtsp_url": "rtsp://35.185.165.215:31554/mystream8",
+        "status": "",
+        "start_time": "",
+        "stop_time": ""
+    }
+]

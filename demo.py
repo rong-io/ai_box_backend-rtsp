@@ -15,12 +15,21 @@ import numpy as np
 import ffmpeg
 import threading
 from asyncio import Queue
+from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime
 
 from nanoowl.tree import Tree
 from nanoowl.tree_predictor import TreePredictor, TreeOutput
 
 # from nanoowl.tree_drawing import draw_tree_output
 from nanoowl.owl_predictor import OwlPredictor
+
+RTSP_URL = None
+
+# scheduler
+scheduler = BackgroundScheduler()
+scheduler.start()
+
 
 # LOG FILE SETTING
 LOG_FILE = "app_log.log"
@@ -59,30 +68,35 @@ class RTSPStreamHandler:
         if not self.running:
             self.running = True
             self.camera = cv2.VideoCapture(self.rtsp_url)
+            if not self.camera.isOpened():
+                logger.error(f"Failed to open RTSP stream: {self.rtsp_url}")
+                self.running = False
+                return
             threading.Thread(target=self._capture_loop, daemon=True).start()
+            logger.info(f"RTSP stream {self.rtsp_url} started.")
 
     def stop(self):
         if self.running:
             self.running = False
             if self.camera:
                 self.camera.release()
+            logger.info(f"RTSP stream {self.rtsp_url} stopped.")
 
     def _capture_loop(self):
         while self.running:
-            if not self.camera.isOpened():
-                logger.error(f"Failed to open RTSP stream: {self.rtsp_url}")
-                self.camera = cv2.VideoCapture(self.rtsp_url)
-                continue
-
             ret, frame = self.camera.read()
-            if ret:
-                frame = self._process_frame(frame)
-                if not self.frame_queue.full():
-                    self.frame_queue.put_nowait(frame)
-            else:
+            if not ret:
                 logger.warning(
                     f"Failed to read frame from RTSP stream: {self.rtsp_url}"
                 )
+                continue
+
+            # 處理幀數據並推送到 WebSocket
+            _, buffer = cv2.imencode(".jpg", frame)
+            frame_data = buffer.tobytes()
+
+            for ws in app["websockets"]:
+                asyncio.run(ws.send_bytes(frame_data))
 
     def _process_frame(self, frame):
         try:
@@ -108,22 +122,6 @@ class RTSPStreamHandler:
         return await self.frame_queue.get()
 
 
-# RTSP audio
-def extract_audio(rtsp_url, audio_queue):
-    process = (
-        ffmpeg.input(rtsp_url)
-        .output("pipe:", format="wav", acodec="pcm_s16le", ac=2, ar="44100")
-        .run_async(pipe_stdout=True, pipe_stderr=True)
-    )
-    while True:
-        audio_data = process.stdout.read(4096)
-        if not audio_data:
-            break
-        audio_queue.put(audio_data)
-    process.stdout.close()
-    process.wait()
-
-
 def get_colors(count: int):
     cmap = plt.cm.get_cmap("rainbow", count)
     colors = []
@@ -135,7 +133,12 @@ def get_colors(count: int):
 
 
 def draw_tree_output(
-    image, output: TreeOutput, tree: Tree, draw_text=True, num_colors=8
+    image,
+    output: TreeOutput,
+    tree: Tree,
+    draw_text=True,
+    num_colors=8,
+    valid_region=None,
 ):
     detections = output.detections
     is_pil = not isinstance(image, np.ndarray)
@@ -152,6 +155,15 @@ def draw_tree_output(
         box = [int(x) for x in detection.box]
         pt0 = (box[0], box[1])
         pt1 = (box[2], box[3])
+
+        if valid_region:
+            if (
+                box[0] < valid_region["top_left_x"]
+                or box[1] < valid_region["top_left_y"]
+                or box[2] > valid_region["bottom_right_x"]
+                or box[3] > valid_region["bottom_right_y"]
+            ):
+                continue
 
         # stop drawing "image" box
         skip_detection = any(
@@ -252,11 +264,11 @@ def process_coordinates_with_affine(image, coordinates):
 
 # WebSocket handler for audio transmission
 async def audio_websocket_handler(request):
+    global audio_enabled
+
     ws = web.WebSocketResponse()
     await ws.prepare(request)
     logging.info("Audio WebSocket connected.")
-
-    # rtsp_url = "rtsp://35.185.165.215:31554/mystream1"
 
     process = (
         ffmpeg.input(RTSP_URL)
@@ -274,6 +286,10 @@ async def audio_websocket_handler(request):
 
     try:
         while True:
+            if not audio_enabled:
+                await asyncio.sleep(0.1)
+                continue
+
             audio_data = await asyncio.to_thread(process.stdout.read, 2048)
             if not audio_data:
                 logging.warning("No audio data received, stream ended.")
@@ -289,15 +305,13 @@ async def audio_websocket_handler(request):
 
 
 async def websocket_handler(request):
-    global prompt_data, coordinates_data
+    global prompt_data, coordinates_data, RTSP_URL, audio_enabled
+    audio_enabled = True
 
     ws = web.WebSocketResponse()
     await ws.prepare(request)
     logger.info(f"WebSocket connected: {request.remote}")
     request.app["websockets"].add(ws)
-
-    global audio_enabled
-    audio_enabled = True
 
     try:
         async for msg in ws:
@@ -307,15 +321,72 @@ async def websocket_handler(request):
             data = json.loads(msg.data)
             action = data.get("action")
             stream_id = data.get("stream_id")
+            rtsp_url = data.get("params", {}).get("rtsp_url")
 
             logging.info(f"Received message from websocket: {msg.data}")
 
-            # ?? prompt
+            if action == "start" and rtsp_url:
+                RTSP_URL = rtsp_url
+                logger.info(f"RTSP URL updated to: {RTSP_URL}")
+
+                if "current_stream" in request.app:
+                    request.app["current_stream"].stop()
+
+                stream_handler = RTSPStreamHandler(RTSP_URL)
+                stream_handler.start()
+                request.app["current_stream"] = stream_handler
+
+            elif action == "stop":
+                if "current_stream" in request.app:
+                    request.app["current_stream"].stop()
+                    del request.app["current_stream"]
+                    logger.info("Stream stopped.")
+
+            elif action == "toggle_audio":
+                enable_audio = data.get("enable_audio", True)
+                audio_enabled = enable_audio
+                if audio_enabled:
+                    logger.info(f"Audio streaming enabled for stream: {stream_id}")
+                else:
+                    logger.info(f"Audio streaming disabled for stream: {stream_id}")
+
+            elif action == "schedule_stream":
+                rtsp_url = data.get("rtsp_url")
+                start_time = data.get("start_time")
+                stop_time = data.get("stop_time")
+
+                stream_handler = RTSPStreamHandler(rtsp_url, request.app["predictor"])
+
+                # 排程
+                if start_time:
+                    scheduler.add_job(
+                        stream_handler.start,
+                        "date",
+                        run_date=datetime.fromisoformat(start_time),
+                        id=f"start_{rtsp_url}",
+                        replace_existing=True,
+                    )
+                    logger.info(
+                        f"Scheduled start for RTSP stream: {rtsp_url} at {start_time}"
+                    )
+
+                if stop_time:
+                    scheduler.add_job(
+                        stream_handler.stop,
+                        "date",
+                        run_date=datetime.fromisoformat(stop_time),
+                        id=f"stop_{rtsp_url}",
+                        replace_existing=True,
+                    )
+                    logger.info(
+                        f"Scheduled stop for RTSP stream: {rtsp_url} at {stop_time}"
+                    )
+
             if "json" in msg.data:
                 try:
                     data = json.loads(msg.data)["json"]
                     prompt = f"[{', '.join([item['object'] for item in data])}]"
-                    threshold = {
+                    thresholds = {
                         item["object"]: float(item["threshold"]) for item in data
                     }
                     logging.info(f"Converted prompt: {prompt}")
@@ -328,48 +399,50 @@ async def websocket_handler(request):
                         "tree": tree,
                         "clip_encodings": clip_encodings,
                         "owl_encodings": owl_encodings,
-                        "threshold": threshold,
+                        "thresholds": thresholds,
                     }
                 except Exception as e:
                     logging.error(f"Error generating prompt data: {e}")
 
-            elif "coordinate" in msg.data:
+            elif any(
+                key in msg.data
+                for key in ["top_left", "top_right", "bottom_left", "bottom_right"]
+            ):
                 try:
-                    raw_coordinates = json.loads(msg.data)["coordinate"]
-                    coordinates = json.loads(raw_coordinates)
+                    raw_coordinates = json.loads(msg.data)
 
-                    for coord in coordinates:
-                        required_keys = [
-                            "top_left_x",
-                            "top_left_y",
-                            "top_right_x",
-                            "top_right_y",
-                            "bottom_right_x",
-                            "bottom_right_y",
-                            "bottom_left_x",
-                            "bottom_left_y",
-                        ]
-                        if not all(key in coord for key in required_keys):
-                            raise ValueError(f"Incomplete coordinate data: {coord}")
-                    coordinates_data = coordinates
+                    required_keys = [
+                        "top_left",
+                        "top_right",
+                        "bottom_left",
+                        "bottom_right",
+                    ]
+                    if not all(key in raw_coordinates for key in required_keys):
+                        raise ValueError(
+                            f"Incomplete coordinate data: {raw_coordinates}"
+                        )
+
+                    for key in required_keys:
+                        if not all(k in raw_coordinates[key] for k in ["x", "y"]):
+                            raise ValueError(
+                                f"Incomplete data for {key}: {raw_coordinates[key]}"
+                            )
+
+                    coordinates_data = {
+                        "top_left_x": raw_coordinates["top_left"]["x"],
+                        "top_left_y": raw_coordinates["top_left"]["y"],
+                        "top_right_x": raw_coordinates["top_right"]["x"],
+                        "top_right_y": raw_coordinates["top_right"]["y"],
+                        "bottom_left_x": raw_coordinates["bottom_left"]["x"],
+                        "bottom_left_y": raw_coordinates["bottom_left"]["y"],
+                        "bottom_right_x": raw_coordinates["bottom_right"]["x"],
+                        "bottom_right_y": raw_coordinates["bottom_right"]["y"],
+                    }
+
                     logging.info(f"Coordinates updated: {coordinates_data}")
                 except Exception as e:
                     logging.error(f"Error parsing coordinates: {e}")
 
-            # 處理 streams 開關 -> 改成用i/f moudle 讀 config 來執行
-            elif "action" in msg.data:
-                if action == "enable":
-                    for sid, handler in request.app["streams"].items():
-                        if sid == stream_id:
-                            handler.start()
-                            logger.info(f"Stream {stream_id} started.")
-                        else:
-                            handler.stop()
-                            logger.info(f"Stream {sid} stopped.")
-                elif action == "disable":
-                    if stream_id in request.app["streams"]:
-                        request.app["streams"][stream_id].stop()
-                        logger.info(f"Stream {stream_id} stopped.")
     finally:
         request.app["websockets"].discard(ws)
 
@@ -391,6 +464,8 @@ async def handle_index_get(request: web.Request):
 
 
 async def on_shutdown(app: web.Application):
+    if "current_stream" in app:
+        app["current_stream"].stop
     for ws in set(app["websockets"]):
         await ws.close(code=WSCloseCode.GOING_AWAY, message="Server shutdown")
 
@@ -413,7 +488,7 @@ async def detection_loop(app: web.Application):
         global camera
 
         re, image = camera.read()
-        logging.info(f"RTSP stream read result: {re}")
+        # logging.info(f"RTSP stream read result: {re}")
 
         if not re:
             warning_msg = "Failed to capture frame from RTSP stream."
@@ -443,46 +518,75 @@ async def detection_loop(app: web.Application):
                 if coordinates_data:
                     logging.info(f"Processing coordinates: {coordinates_data}")
                     image, transformed_regions = process_coordinates_with_affine(
-                        image, coordinates_data
+                        image, [coordinates_data]
                     )
                     if not transformed_regions:
                         logging.warning(
                             "No valid regions found after affine transformation."
                         )
                         return image
+
                     detections = []
+
                     for warped_image, (src_pts, dst_pts) in transformed_regions:
                         try:
                             cropped_pil = cv2_to_pil(warped_image)
+
                             region_detections = predictor.predict(
                                 image=cropped_pil,
                                 tree=prompt_data_local["tree"],
                                 clip_text_encodings=prompt_data_local["clip_encodings"],
                                 owl_text_encodings=prompt_data_local["owl_encodings"],
-                                threshold=prompt_data_local["thresholds"],
                             )
-                            detections.extend(region_detections)
+
+                            if isinstance(region_detections, TreeOutput):
+                                detections.extend(region_detections.detections)
+                            elif isinstance(region_detections, list):
+                                detections.extend(region_detections)
+                            else:
+                                logging.error("Unexpected predictor output type.")
+
                         except Exception as e:
                             logging.error(f"Prediction error for region: {e}")
-                    image = draw_tree_output(
-                        image, detections, prompt_data_local["tree"]
-                    )
+                            region_detections = []
+                    try:
+                        tree_output = TreeOutput(detections=detections)
+                        image = draw_tree_output(
+                            image, tree_output, prompt_data_local["tree"]
+                        )
+                    except Exception as e:
+                        logging.error(f"Failed to create TreeOutput: {e}")
 
                 else:
                     logging.info(f"Performing full image detection with prompt_data.")
                     t0 = time.perf_counter_ns()
-                    detections = predictor.predict(
-                        image=image_pil,
-                        tree=prompt_data_local["tree"],
-                        clip_text_encodings=prompt_data_local["clip_encodings"],
-                        owl_text_encodings=prompt_data_local["owl_encodings"],
-                        threshold=prompt_data_local["thresholds"],
-                    )
-                    t1 = time.perf_counter_ns()
-                    dt = (t1 - t0) / 1e9
+                    try:
+                        detections = predictor.predict(
+                            image=image_pil,
+                            tree=prompt_data_local["tree"],
+                            clip_text_encodings=prompt_data_local["clip_encodings"],
+                            owl_text_encodings=prompt_data_local["owl_encodings"],
+                            # threshold=prompt_data_local["thresholds"],
+                        )
+                        t1 = time.perf_counter_ns()
+                        dt = (t1 - t0) / 1e9
 
-                    logging.info(f"Prediction completed in {dt:.3f} seconds.")
-                    logging.info(f"Raw detections: {detections}")
+                        logging.info(f"Prediction completed in {dt:.3f} seconds.")
+                        logging.info(f"Raw detections: {detections}")
+
+                        if isinstance(detections, list):
+                            detections = TreeOutput(detections=detections)
+                        elif not isinstance(detections, TreeOutput):
+                            logging.error(
+                                f"Unexpected prediction output type: {type(detections)}"
+                            )
+                            detections = TreeOutput(detections=[])
+                        logging.info(f"Detections: {detections}")
+                        image = draw_tree_output(
+                            image, detections, prompt_data_local["tree"]
+                        )
+                    except Exception as e:
+                        logging.error(f"Prediction error: {e}")
 
                 if not detections:
                     logging.warning("No detections made.")
@@ -542,12 +646,6 @@ if __name__ == "__main__":
     CAMERA_DEVICE = args.camera
     RTSP_URL = args.rtsp_url
     IMAGE_QUALITY = args.image_quality
-
-    # Start audio extraction thread
-    audio_thread = threading.Thread(
-        target=extract_audio, args=(RTSP_URL, audio_queue), daemon=True
-    )
-    audio_thread.start()
 
     predictor = TreePredictor(
         owl_predictor=OwlPredictor(image_encoder_engine=args.image_encode_engine)
