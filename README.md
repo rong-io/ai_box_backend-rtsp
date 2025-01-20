@@ -30,8 +30,13 @@ docker run --name prometheus -d -p 127.0.0.1:9090:9090 prom/prometheus
 
 開啟 containers：
 ```
-jetson-containers run --workdir /opt/nanoowl --volume $(pwd):/app $(autotag nanoowl)
+jetson-containers run --name jetson_container_20250118_231824 --workdir /opt/nanoowl --volume $(pwd):/app $(autotag nanoowl)
 ```
+若無法開啟，請使用：
+```
+./jetson-containers run --name jetson_container_20250118_231824 --workdir /opt/nanoowl --volume $(pwd):/app dustynv/nanoowl:r36.3.0
+```
+
 ```
 sudo docker start node-exporter
 ```
@@ -46,7 +51,7 @@ apt-get update && apt-get install -y ffmpeg && pip3 install ffmpeg-python && pip
 
 於容器內開啟後端：
 ```
-jetson-containers run --name jetson_container_20250118_231824 --workdir /opt/nanoowl --volume $(pwd):/app $(autotag nanoowl)
+python3 /app/demo.py data/owl_image_encoder_patch32.engine
 ```
 
 於本機執行 camera manager：（用於抓取相機清單及其它輔助功能如抓取 GPU status 等）
