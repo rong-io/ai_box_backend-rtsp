@@ -17,6 +17,7 @@ import threading
 from asyncio import Queue
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime
+import os
 
 from nanoowl.tree import Tree
 from nanoowl.tree_predictor import TreePredictor, TreeOutput
@@ -24,7 +25,9 @@ from nanoowl.tree_predictor import TreePredictor, TreeOutput
 # from nanoowl.tree_drawing import draw_tree_output
 from nanoowl.owl_predictor import OwlPredictor
 
-RTSP_URL = None
+infer_enabled = False
+camera = None
+camera_needs_reset = False # 當 RTSP_URL 更新時重開 camera
 
 # scheduler
 scheduler = BackgroundScheduler()
@@ -32,7 +35,10 @@ scheduler.start()
 
 
 # LOG FILE SETTING
-LOG_FILE = "app_log.log"
+LOG_DIR = os.path.join(os.getcwd(), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+LOG_FILE = os.path.join(LOG_DIR, "app_log.log")
 LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -91,7 +97,6 @@ class RTSPStreamHandler:
                 )
                 continue
 
-            # 處理幀數據並推送到 WebSocket
             _, buffer = cv2.imencode(".jpg", frame)
             frame_data = buffer.tobytes()
 
@@ -271,7 +276,7 @@ async def audio_websocket_handler(request):
     logging.info("Audio WebSocket connected.")
 
     process = (
-        ffmpeg.input(RTSP_URL)
+        ffmpeg.input(rtsp_url)
         .output(
             "pipe:",
             format="adts",
@@ -305,8 +310,8 @@ async def audio_websocket_handler(request):
 
 
 async def websocket_handler(request):
-    global prompt_data, coordinates_data, RTSP_URL, audio_enabled
-    audio_enabled = True
+    global prompt_data, coordinates_data, RTSP_URL, audio_enabled, infer_enabled, camera_needs_reset
+    audio_enabled = False
 
     ws = web.WebSocketResponse()
     await ws.prepare(request)
@@ -315,26 +320,32 @@ async def websocket_handler(request):
 
     try:
         async for msg in ws:
-            # ws json object prompt : {"json": "[{\"object\": \"apple\", \"threshold\": \"0.5\"}, {\"object\": \"banana\", \"threshold\": \"0.5\"}]"}
-            # ws json testing data example: {"coordinate": "[{\"top_left_x\": \"200\",\"top_left_y\": \"250\", \"bottom_left_x\": \"500\", \"bottom_left_y\": \"550\"}]"}
-
             data = json.loads(msg.data)
             action = data.get("action")
             stream_id = data.get("stream_id")
-            rtsp_url = data.get("params", {}).get("rtsp_url")
+            rtsp_url = data.get("rtsp_url")
 
             logging.info(f"Received message from websocket: {msg.data}")
 
             if action == "start" and rtsp_url:
-                RTSP_URL = rtsp_url
-                logger.info(f"RTSP URL updated to: {RTSP_URL}")
+                if rtsp_url != RTSP_URL:
+                    # RTSP_URL = rtsp_url
+                    camera_needs_reset = True
+                    logger.info(f"RTSP URL updated to: {rtsp_url}")
+                else:
+                    logger.info("Recived same RTSP URL.")
 
                 if "current_stream" in request.app:
                     request.app["current_stream"].stop()
 
-                stream_handler = RTSPStreamHandler(RTSP_URL)
+                stream_handler = RTSPStreamHandler(rtsp_url)
                 stream_handler.start()
                 request.app["current_stream"] = stream_handler
+
+            elif action == "toggle_infer":
+                enable_infer_str = data.get("enable_infer", "true")
+                infer_enabled = (enable_infer_str == "true")
+                logger.info(f"infer_enabled set to: {infer_enabled}")
 
             elif action == "stop":
                 if "current_stream" in request.app:
@@ -471,11 +482,11 @@ async def on_shutdown(app: web.Application):
 
 
 async def detection_loop(app: web.Application):
-    global camera
+    global camera, RTSP_URL, camera_needs_reset
     loop = asyncio.get_running_loop()
 
     logging.info("Opening camera.")
-    camera = cv2.VideoCapture(RTSP_URL)
+    camera = cv2.VideoCapture(rtsp_url)
 
     if not camera.isOpened():
         logging.error("Failed to open RTSP stream.")
@@ -483,9 +494,19 @@ async def detection_loop(app: web.Application):
 
     logging.info("Loading predictor.")
 
+    last_time = time.time()
+    frame_count = 0
+    fps_val = 0
+
     def _read_and_encode_image():
-        global coordinates_data
-        global camera
+        global camera, RTSP_URL, camera_needs_reset, infer_enabled
+
+        if camera_needs_reset:
+            logger.info(f"switch RTSP input to: {RTSP_URL}")
+            if camera is not None:
+                camera.release()
+            camera = cv2.VideoCapture(rtsp_url)
+            camera_needs_reset = False
 
         re, image = camera.read()
         # logging.info(f"RTSP stream read result: {re}")
@@ -493,15 +514,9 @@ async def detection_loop(app: web.Application):
         if not re:
             warning_msg = "Failed to capture frame from RTSP stream."
             logging.warning(warning_msg)
-            warning_data = {"type": "warning", "message": warning_msg}
-            asyncio.run(send_warning_to_clients(warning_data))
 
-            # ????
             camera.release()
-            camera = cv2.VideoCapture(RTSP_URL)
-            if not camera.isOpened():
-                logging.error("Reconnection attempt failed.")
-                return re, None
+            camera = cv2.VideoCapture(rtsp_url)
 
             return re, None
 
@@ -509,8 +524,9 @@ async def detection_loop(app: web.Application):
         Detection phase
         """
         image_pil = cv2_to_pil(image)
+        detections = []
 
-        if prompt_data is not None:
+        if prompt_data is not None and infer_enabled:
             try:
                 prompt_data_local = prompt_data
                 # logging.info(f"Using prompt_data: {prompt_data_local}")
@@ -525,8 +541,6 @@ async def detection_loop(app: web.Application):
                             "No valid regions found after affine transformation."
                         )
                         return image
-
-                    detections = []
 
                     for warped_image, (src_pts, dst_pts) in transformed_regions:
                         try:
@@ -561,30 +575,30 @@ async def detection_loop(app: web.Application):
                     logging.info(f"Performing full image detection with prompt_data.")
                     t0 = time.perf_counter_ns()
                     try:
-                        detections = predictor.predict(
-                            image=image_pil,
-                            tree=prompt_data_local["tree"],
-                            clip_text_encodings=prompt_data_local["clip_encodings"],
-                            owl_text_encodings=prompt_data_local["owl_encodings"],
-                            # threshold=prompt_data_local["thresholds"],
-                        )
-                        t1 = time.perf_counter_ns()
-                        dt = (t1 - t0) / 1e9
-
-                        logging.info(f"Prediction completed in {dt:.3f} seconds.")
-                        logging.info(f"Raw detections: {detections}")
-
-                        if isinstance(detections, list):
-                            detections = TreeOutput(detections=detections)
-                        elif not isinstance(detections, TreeOutput):
-                            logging.error(
-                                f"Unexpected prediction output type: {type(detections)}"
+                            detections = predictor.predict(
+                                image=image_pil,
+                                tree=prompt_data_local["tree"],
+                                clip_text_encodings=prompt_data_local["clip_encodings"],
+                                owl_text_encodings=prompt_data_local["owl_encodings"],
+                                # threshold=prompt_data_local["thresholds"],
                             )
-                            detections = TreeOutput(detections=[])
-                        logging.info(f"Detections: {detections}")
-                        image = draw_tree_output(
-                            image, detections, prompt_data_local["tree"]
-                        )
+                            t1 = time.perf_counter_ns()
+                            dt = (t1 - t0) / 1e9
+
+                            logging.info(f"Prediction completed in {dt:.3f} seconds.")
+                            logging.info(f"Raw detections: {detections}")
+
+                            if isinstance(detections, list):
+                                detections = TreeOutput(detections=detections)
+                            elif not isinstance(detections, TreeOutput):
+                                logging.error(
+                                    f"Unexpected prediction output type: {type(detections)}"
+                                )
+                                detections = TreeOutput(detections=[])
+                            logging.info(f"Detections: {detections}")
+                            image = draw_tree_output(
+                                image, detections, prompt_data_local["tree"]
+                            )
                     except Exception as e:
                         logging.error(f"Prediction error: {e}")
 
@@ -606,13 +620,36 @@ async def detection_loop(app: web.Application):
 
     try:
         while True:
-            re, image = await loop.run_in_executor(None, _read_and_encode_image)
+            ret, image_data = await loop.run_in_executor(None, _read_and_encode_image)
 
-            if not re:
+            if not ret or image_data is None:
                 continue
 
             for ws in app["websockets"]:
-                await ws.send_bytes(image)
+                try:
+                    await ws.send_bytes(image_data)
+                except Exception as e:
+                    logger.error(f"Failed to send frame to client: {e}")
+
+            frame_count += 1
+            now = time.time()
+            if now - last_time >= 1.0: # per 1 sec
+                fps_val = frame_count / (now - last_time)
+                frame_count = 0
+                last_time = now
+
+            fps_data = {
+                "type": "fps",
+                "value": round(fps_val, 2)
+            }
+
+            fps_json = json.dumps(fps_data)
+
+            for ws in app["websockets"]:
+                try:
+                        await ws.send_str(fps_json)
+                except Exception as e:
+                    logger.error(f"Failed to send fps info: {e}")
     finally:
         camera.release()
 
@@ -639,7 +676,7 @@ if __name__ == "__main__":
         "--rtsp_url",
         type=str,
         help="RTSP stream URL",
-        default="rtsp://35.185.165.215:31554/mystream1",
+        default="rtsp://rtspstream:nbuHSDAKaijbiQnDw9fby@zephyr.rtsp.stream/people",
     )
     args = parser.parse_args()
 

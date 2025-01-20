@@ -18,12 +18,18 @@ if __name__ == "__main__":
         default="ws://0.0.0.0:7860/ws", 
         help="WebSocket server URL (default: ws://0.0.0.0:7860/ws)"
     )
-    # 預設值包含單筆測試資料
+    # 預設值包含 schedule_stream 測試資料
     parser.add_argument(
         "--json", 
         type=str, 
-        default='{"coordinate": "[{\\"top_left_x\\": 897.07, \\"top_left_y\\": 368.89, \\"top_right_x\\": 1039.91, \\"top_right_y\\": 368.89, \\"bottom_right_x\\": 1039.91, \\"bottom_right_y\\": 588.74, \\"bottom_left_x\\": 897.07, \\"bottom_left_y\\": 588.74}]"}',
-        help="JSON message to send (default: single test data)"
+        default=json.dumps({
+            "action": "start",
+            "stream_id": "camera_1",
+            "rtsp_url": "rtsp://35.185.165.215:31554/mystream1",
+            "start_time": "",
+            "stop_time": ""
+        }),
+        help="JSON message to send (default: schedule_stream test data)"
     )
     args = parser.parse_args()
 
